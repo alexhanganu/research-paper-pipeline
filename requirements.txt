@@ -1,0 +1,17 @@
+# Core dependencies for research paper processing pipeline
+
+# AI API clients
+anthropic>=0.40.0  # For Claude API
+openai>=1.0.0      # For GPT API
+
+# PDF text extraction
+pypdf>=4.0.0
+
+# Progress bar
+tqdm>=4.66.0
+
+# Data handling (usually pre-installed with Python)
+pandas>=2.0.0
+
+# Additional utilities
+python-dotenv>=1.0.0  # For loading API keys from .env file
