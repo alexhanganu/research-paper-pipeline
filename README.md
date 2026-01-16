@@ -86,6 +86,17 @@ Process all PDFs using OpenAI GPT:
 python project/scripts/process_papers.py --provider openai
 ```
 
+With LangChain
+```bash
+python project/scripts/process_papers.py --use-langchain --provider anthropic
+```
+
+With custom settings
+```bash
+python project/scripts/process_papers.py --workers 10 --provider openai --use-langchain
+```
+
+
 ### Advanced Options
 
 ```bash
@@ -143,9 +154,32 @@ research-paper-pipeline/
 │   ├── outputs/                 # Results saved here
 │   └── scripts/
 │       ├── extract_text.py      # PDF text extraction
-│       ├── summarize.py         # Claude AI summarization
+│       ├── summarize.py         # AI summarization
 │       └── process_papers.py    # Main pipeline orchestrator
 ```
+
+
+## Lambda Deployment
+
+Deploy everything
+```bash
+./deploy_lambda.sh
+```
+
+Or use Terraform directly
+```bash
+terraform init
+terraform plan
+terraform apply
+```
+
+## Monitoring
+
+Start dashboard
+```bash
+streamlit run monitoring_dashboard.py
+```
+
 
 ## Cost Estimation
 

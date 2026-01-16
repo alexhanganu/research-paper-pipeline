@@ -11,12 +11,49 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import sys
+from datetime import datetime
+from tenacity import retry, stop_after_attempt, wait_exponential
+import numpy as np
+
+try:
+    import boto3
+    CLOUDWATCH_AVAILABLE = True
+except ImportError:
+    CLOUDWATCH_AVAILABLE = False
 
 # Import our other modules
 sys.path.append(str(Path(__file__).parent))
 from extract_text import extract_text_from_pdf
 from summarize import summarize_paper, estimate_cost
 
+def send_cloudwatch_metric(metric_name, value, unit='Count', dimensions=None):
+    """Send metrics to CloudWatch if available"""
+    if not CLOUDWATCH_AVAILABLE:
+        return
+    
+    try:
+        cloudwatch = boto3.client('cloudwatch')
+        metric_data = {
+            'MetricName': metric_name,
+            'Value': value,
+            'Unit': unit,
+            'Timestamp': datetime.utcnow()
+        }
+        
+        if dimensions:
+            metric_data['Dimensions'] = dimensions
+        
+        cloudwatch.put_metric_data(
+            Namespace='ResearchPaperProcessing',
+            MetricData=[metric_data]
+        )
+    except Exception as e:
+        print(f"Warning: Failed to send CloudWatch metric: {e}")
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10)
+)
 def process_single_paper(pdf_path, output_dir, api_key, provider):
     """
     Process a single paper: extract text and summarize.
@@ -67,6 +104,39 @@ def process_single_paper(pdf_path, output_dir, api_key, provider):
     
     return summary_result
 
+def track_metrics(results, start_time, end_time, provider):
+    """Calculate and save performance metrics"""
+    duration = end_time - start_time
+    successful = sum(1 for r in results if r.get('status') == 'success')
+    
+    # Calculate quality scores
+    quality_scores = [r.get('quality_score', 0) for r in results if r.get('status') == 'success' and r.get('quality_score')]
+    avg_quality = np.mean(quality_scores) if quality_scores else 0
+    
+    # Count biomarkers
+    total_biomarkers = sum(len(r.get('biomarkers', [])) for r in results if r.get('status') == 'success')
+    
+    metrics = {
+        'timestamp': datetime.now().isoformat(),
+        'provider': provider,
+        'total_papers': len(results),
+        'successful': successful,
+        'failed': len(results) - successful,
+        'duration_seconds': duration,
+        'papers_per_minute': (len(results) / duration) * 60 if duration > 0 else 0,
+        'average_quality_score': float(avg_quality),
+        'total_biomarkers_extracted': total_biomarkers
+    }
+    
+    # Send to CloudWatch
+    send_cloudwatch_metric('TotalPapersProcessed', len(results), dimensions=[{'Name': 'Provider', 'Value': provider}])
+    send_cloudwatch_metric('SuccessfulProcessing', successful, dimensions=[{'Name': 'Provider', 'Value': provider}])
+    send_cloudwatch_metric('FailedProcessing', len(results) - successful, dimensions=[{'Name': 'Provider', 'Value': provider}])
+    send_cloudwatch_metric('AverageQualityScore', avg_quality, unit='None', dimensions=[{'Name': 'Provider', 'Value': provider}])
+    send_cloudwatch_metric('TotalBiomarkers', total_biomarkers, dimensions=[{'Name': 'Provider', 'Value': provider}])
+    
+    return metrics
+
 def save_results_to_csv(results, output_path):
     """
     Save results to a CSV file.
@@ -84,6 +154,7 @@ def save_results_to_csv(results, output_path):
         'filename',
         'status',
         'api_provider',
+        'processing_method',
         'title',
         'authors',
         'year',
@@ -94,6 +165,9 @@ def save_results_to_csv(results, output_path):
         'conclusions',
         'limitations',
         'future_work',
+        'num_biomarkers',
+        'biomarkers',
+        'quality_score',
         'num_pages',
         'text_length',
         'chunks_processed',
@@ -109,13 +183,21 @@ def save_results_to_csv(results, output_path):
             if 'key_findings' in result and isinstance(result['key_findings'], list):
                 result['key_findings'] = ' | '.join(result['key_findings'])
             
+            # Process biomarkers
+            if 'biomarkers' in result and isinstance(result['biomarkers'], list):
+                result['num_biomarkers'] = len(result['biomarkers'])
+                # Convert biomarkers to JSON string for CSV
+                result['biomarkers'] = json.dumps(result['biomarkers'])
+            else:
+                result['num_biomarkers'] = 0
+            
             # Fill in missing fields
             row = {field: result.get(field, '') for field in fieldnames}
             writer.writerow(row)
     
     print(f"\nResults saved to: {output_path}")
 
-def main(papers_dir='project/papers', output_dir='project/outputs', max_workers=5, provider='anthropic'):
+def main(papers_dir='project/papers', output_dir='project/outputs', max_workers=5, provider='anthropic', use_langchain=False):
     """
     Main pipeline to process all papers.
     
@@ -124,7 +206,9 @@ def main(papers_dir='project/papers', output_dir='project/outputs', max_workers=
         output_dir: Directory to save results
         max_workers: Number of parallel workers for API calls
         provider: 'anthropic' or 'openai'
+        use_langchain: Whether to use LangChain pipeline
     """
+    start_time = time.time()
     # Validate provider
     provider = provider.lower()
     if provider not in ['anthropic', 'openai']:
@@ -165,6 +249,7 @@ def main(papers_dir='project/papers', output_dir='project/outputs', max_workers=
     print(f"Research Paper Processing Pipeline")
     print(f"{'='*60}")
     print(f"API Provider: {provider.upper()}")
+    print(f"Processing Method: {'LangChain' if use_langchain else 'Direct API'}")
     print(f"Found {len(pdf_files)} PDF files")
     
     # Estimate costs
@@ -228,6 +313,15 @@ def main(papers_dir='project/papers', output_dir='project/outputs', max_workers=
         json.dump(results, f, indent=2)
     print(f"Detailed results saved to: {json_path}")
     
+    # Calculate and save metrics
+    end_time = time.time()
+    metrics = track_metrics(results, start_time, end_time, provider)
+    
+    metrics_path = Path(output_dir) / f'metrics_{datetime.now().strftime("%Y%m%d_%H%M%S")}_{provider}.json'
+    with open(metrics_path, 'w', encoding='utf-8') as f:
+        json.dump(metrics, f, indent=2)
+    print(f"Metrics saved to: {metrics_path}")
+    
     # Print summary statistics
     successful = sum(1 for r in results if r.get('status') == 'success')
     failed = len(results) - successful
@@ -239,6 +333,10 @@ def main(papers_dir='project/papers', output_dir='project/outputs', max_workers=
     print(f"Total papers: {len(results)}")
     print(f"Successful: {successful}")
     print(f"Failed: {failed}")
+    print(f"Processing time: {metrics['duration_seconds']:.2f} seconds")
+    print(f"Papers per minute: {metrics['papers_per_minute']:.2f}")
+    print(f"Average quality score: {metrics['average_quality_score']:.3f}")
+    print(f"Total biomarkers extracted: {metrics['total_biomarkers_extracted']}")
     
     if failed > 0:
         print(f"\nFailed papers:")
@@ -258,7 +356,9 @@ if __name__ == '__main__':
                         help='Number of parallel workers (default: 5)')
     parser.add_argument('--provider', choices=['anthropic', 'openai'], default='anthropic',
                         help='API provider to use: anthropic (Claude) or openai (GPT-4) (default: anthropic)')
+    parser.add_argument('--use-langchain', action='store_true',
+                        help='Use LangChain pipeline for structured extraction (default: False)')
     
     args = parser.parse_args()
     
-    main(args.papers_dir, args.output_dir, args.workers, args.provider)
+    main(args.papers_dir, args.output_dir, args.workers, args.provider, args.use_langchain)

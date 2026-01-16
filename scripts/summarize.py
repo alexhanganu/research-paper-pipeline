@@ -7,6 +7,31 @@ from anthropic import Anthropic
 from openai import OpenAI
 import time
 import json
+from tenacity import retry, stop_after_attempt, wait_exponential
+try:
+    import boto3
+    CLOUDWATCH_AVAILABLE = True
+except ImportError:
+    CLOUDWATCH_AVAILABLE = False
+
+def send_metric(metric_name, value, provider):
+    """Send metrics to CloudWatch if available"""
+    if not CLOUDWATCH_AVAILABLE:
+        return
+    
+    try:
+        cloudwatch = boto3.client('cloudwatch')
+        cloudwatch.put_metric_data(
+            Namespace='ResearchPaperProcessing',
+            MetricData=[{
+                'MetricName': metric_name,
+                'Value': value,
+                'Unit': 'Count',
+                'Dimensions': [{'Name': 'Provider', 'Value': provider}]
+            }]
+        )
+    except Exception as e:
+        print(f"Warning: Failed to send CloudWatch metric: {e}")
 
 def chunk_text(text, max_chars=100000):
     """
@@ -40,6 +65,11 @@ def chunk_text(text, max_chars=100000):
     
     return chunks
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    reraise=True
+)
 def summarize_paper_claude(text, filename, api_key):
     """
     Use Claude to summarize a research paper and extract key information.
@@ -97,6 +127,8 @@ Here is the research paper{' (part 1 of ' + str(len(chunks)) + ')' if len(chunks
             messages=[{"role": "user", "content": prompt}]
         )
         
+        send_metric('APICallSuccess', 1, 'anthropic')
+        
         response_text = message.content[0].text
         
         # Clean up the response (remove markdown code blocks if present)
@@ -119,6 +151,7 @@ Here is the research paper{' (part 1 of ' + str(len(chunks)) + ')' if len(chunks
         return result
         
     except json.JSONDecodeError as e:
+        send_metric('JSONParseError', 1, 'anthropic')
         print(f"  ✗ JSON parsing error: {e}")
         print(f"  Response: {response_text[:200]}...")
         return {
@@ -129,6 +162,7 @@ Here is the research paper{' (part 1 of ' + str(len(chunks)) + ')' if len(chunks
             'api_provider': 'anthropic'
         }
     except Exception as e:
+        send_metric('APICallError', 1, 'anthropic')
         print(f"  ✗ API error: {e}")
         return {
             'filename': filename,
@@ -137,6 +171,11 @@ Here is the research paper{' (part 1 of ' + str(len(chunks)) + ')' if len(chunks
             'api_provider': 'anthropic'
         }
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    reraise=True
+)
 def summarize_paper_openai(text, filename, api_key):
     """
     Use OpenAI to summarize a research paper and extract key information.
@@ -198,6 +237,8 @@ Here is the research paper{' (part 1 of ' + str(len(chunks)) + ')' if len(chunks
             max_tokens=2000
         )
         
+        send_metric('APICallSuccess', 1, 'openai')
+        
         response_text = response.choices[0].message.content
         
         # Clean up the response (remove markdown code blocks if present)
@@ -220,6 +261,7 @@ Here is the research paper{' (part 1 of ' + str(len(chunks)) + ')' if len(chunks
         return result
         
     except json.JSONDecodeError as e:
+        send_metric('JSONParseError', 1, 'openai')
         print(f"  ✗ JSON parsing error: {e}")
         print(f"  Response: {response_text[:200]}...")
         return {
@@ -230,6 +272,7 @@ Here is the research paper{' (part 1 of ' + str(len(chunks)) + ')' if len(chunks
             'api_provider': 'openai'
         }
     except Exception as e:
+        send_metric('APICallError', 1, 'openai')
         print(f"  ✗ API error: {e}")
         return {
             'filename': filename,
@@ -268,6 +311,7 @@ def summarize_paper(text, filename, api_key=None, provider='anthropic'):
     else:
         raise ValueError(f"Unknown provider: {provider}. Use 'anthropic' or 'openai'.")
 
+
 def estimate_cost(num_papers, avg_chars_per_paper=50000, provider='anthropic'):
     """
     Estimate API costs for processing papers.
@@ -298,6 +342,21 @@ def estimate_cost(num_papers, avg_chars_per_paper=50000, provider='anthropic'):
         'input_tokens': f"{input_tokens:,.0f}",
         'output_tokens': f"{output_tokens:,.0f}"
     }
+
+def validate_extraction(result):
+    """Validate extracted information quality"""
+    checks = {
+        'has_title': bool(result.get('title') and result['title'] != 'Not found'),
+        'has_authors': bool(result.get('authors') and result['authors'] != 'Not found'),
+        'has_findings': bool(result.get('key_findings') and len(result.get('key_findings', [])) > 0),
+        'reasonable_year': validate_year(result.get('year')),
+        'sufficient_abstract': len(result.get('abstract', '')) > 50
+    }
+    
+    result['quality_score'] = sum(checks.values()) / len(checks)
+    result['quality_checks'] = checks
+    return result
+
 
 if __name__ == '__main__':
     # Test with a sample text
