@@ -255,7 +255,7 @@ If you use this tool in your research, please cite:
 ```bibtex
 @software{research_paper_pipeline,
   title = {Research Paper Processing Pipeline},
-  author = {Your Name},
+  author = {Alexandru Hanganu},
   year = {2025},
   url = {https://github.com/alexhanganu/research-paper-pipeline}
 }
