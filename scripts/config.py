@@ -14,6 +14,17 @@ ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
 DEFAULT_PROVIDER = os.environ.get('DEFAULT_PROVIDER', 'anthropic')
 
+# PubMed Configuration
+PUBMED_EMAIL = os.environ.get('PUBMED_EMAIL', 'user@example.com')
+NCBI_API_KEY = os.environ.get('NCBI_API_KEY', '')  # Optional, increases rate limit
+
+# Email Configuration
+SMTP_SERVER = os.environ.get('SMTP_SERVER', 'smtp.gmail.com')
+SMTP_PORT = int(os.environ.get('SMTP_PORT', '587'))
+SMTP_USER = os.environ.get('SMTP_USER', '')
+SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD', '')
+FROM_EMAIL = os.environ.get('FROM_EMAIL', SMTP_USER)
+
 # Processing Configuration
 DEFAULT_PAPERS_DIR = os.environ.get('PAPERS_DIR', 'project/papers')
 DEFAULT_OUTPUT_DIR = os.environ.get('OUTPUT_DIR', 'project/outputs')
@@ -30,11 +41,20 @@ TEMPERATURE = float(os.environ.get('TEMPERATURE', '0.3'))
 MAX_CHARS_PER_CHUNK = int(os.environ.get('MAX_CHARS_PER_CHUNK', '100000'))
 OPENAI_MAX_CHARS_PER_CHUNK = int(os.environ.get('OPENAI_MAX_CHARS_PER_CHUNK', '80000'))
 
-# AWS Configuration (for Lambda deployment)
+# Cloud Configuration
+CLOUD_PROVIDER = os.environ.get('CLOUD_PROVIDER', 'local')  # local, aws, azure
+
+# AWS Configuration
 AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
-RESULTS_BUCKET = os.environ.get('RESULTS_BUCKET', '')
+AWS_S3_BUCKET = os.environ.get('AWS_S3_BUCKET', '')
+RESULTS_BUCKET = os.environ.get('RESULTS_BUCKET', AWS_S3_BUCKET)
 DLQ_URL = os.environ.get('DLQ_URL', '')
 ENVIRONMENT = os.environ.get('ENVIRONMENT', 'prod')
+
+# Azure Configuration
+AZURE_STORAGE_CONNECTION_STRING = os.environ.get('AZURE_STORAGE_CONNECTION_STRING', '')
+AZURE_CONTAINER_NAME = os.environ.get('AZURE_CONTAINER_NAME', 'research-papers')
+AZURE_COMMUNICATION_CONNECTION_STRING = os.environ.get('AZURE_COMMUNICATION_CONNECTION_STRING', '')
 
 # CloudWatch Configuration
 CLOUDWATCH_NAMESPACE = os.environ.get('CLOUDWATCH_NAMESPACE', 'ResearchPaperProcessing')
@@ -48,6 +68,9 @@ RETRY_MAX_WAIT = int(os.environ.get('RETRY_MAX_WAIT', '10'))
 # Quality Check Configuration
 MIN_QUALITY_SCORE = float(os.environ.get('MIN_QUALITY_SCORE', '0.5'))
 ENABLE_QUALITY_CHECKS = os.environ.get('ENABLE_QUALITY_CHECKS', 'true').lower() == 'true'
+
+# Biomarker Aggregation Configuration
+MIN_PAPERS_FOR_HIGH_CONFIDENCE = int(os.environ.get('MIN_PAPERS_FOR_HIGH_CONFIDENCE', '2'))
 
 # Cost Estimation (per million tokens)
 CLAUDE_INPUT_COST = float(os.environ.get('CLAUDE_INPUT_COST', '3.0'))
@@ -81,12 +104,21 @@ def validate_config():
     if not 0 <= TEMPERATURE <= 1:
         errors.append(f"TEMPERATURE must be between 0 and 1, got {TEMPERATURE}")
     
+    # Check cloud configuration
+    if CLOUD_PROVIDER == 'aws' and not AWS_S3_BUCKET:
+        errors.append("AWS_S3_BUCKET not set but cloud provider is 'aws'")
+    
+    if CLOUD_PROVIDER == 'azure' and not AZURE_STORAGE_CONNECTION_STRING:
+        errors.append("AZURE_STORAGE_CONNECTION_STRING not set but cloud provider is 'azure'")
+    
     return errors
 
 def get_config_summary():
     """Get a summary of current configuration"""
     return {
+        'platform': os.name,
         'provider': DEFAULT_PROVIDER,
+        'cloud_provider': CLOUD_PROVIDER,
         'model': CLAUDE_MODEL if DEFAULT_PROVIDER == 'anthropic' else OPENAI_MODEL,
         'workers': DEFAULT_WORKERS,
         'use_langchain': USE_LANGCHAIN,
@@ -94,7 +126,8 @@ def get_config_summary():
         'output_dir': DEFAULT_OUTPUT_DIR,
         'cloudwatch_enabled': ENABLE_CLOUDWATCH,
         'quality_checks_enabled': ENABLE_QUALITY_CHECKS,
-        'max_retries': MAX_RETRIES
+        'max_retries': MAX_RETRIES,
+        'pubmed_email': PUBMED_EMAIL
     }
 
 if __name__ == '__main__':

@@ -1,6 +1,8 @@
 """
 Main pipeline to process all papers: extract text, summarize, and save to CSV.
 Supports both Anthropic Claude and OpenAI GPT APIs.
+Cross-platform: Windows, macOS, Linux.
+Cloud support: Local, AWS, Azure.
 """
 
 import os
@@ -25,6 +27,10 @@ except ImportError:
 sys.path.append(str(Path(__file__).parent))
 from extract_text import extract_text_from_pdf
 from summarize import summarize_paper, estimate_cost
+from pubmed_integration import find_new_papers, save_processed_papers, load_processed_papers
+from email_notification import notify_new_papers
+from biomarker_aggregator import BiomarkerAggregator
+from cloud_storage import get_storage_client
 
 def send_cloudwatch_metric(metric_name, value, unit='Count', dimensions=None):
     """Send metrics to CloudWatch if available"""
@@ -54,7 +60,7 @@ def send_cloudwatch_metric(metric_name, value, unit='Count', dimensions=None):
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10)
 )
-def process_single_paper(pdf_path, output_dir, api_key, provider):
+def process_single_paper(pdf_path, output_dir, api_key, provider, use_langchain=False):
     """
     Process a single paper: extract text and summarize.
     
@@ -63,11 +69,12 @@ def process_single_paper(pdf_path, output_dir, api_key, provider):
         output_dir: Directory to save results
         api_key: API key for the chosen provider
         provider: 'anthropic' or 'openai'
+        use_langchain: Whether to use LangChain pipeline
         
     Returns:
         dict with results
     """
-    filename = pdf_path.name
+    filename = pdf_path.name if hasattr(pdf_path, 'name') else os.path.basename(pdf_path)
     
     # Extract text
     extraction_result = extract_text_from_pdf(pdf_path)
@@ -82,18 +89,27 @@ def process_single_paper(pdf_path, output_dir, api_key, provider):
     # Save extracted text
     text_dir = Path(output_dir) / 'extracted_texts'
     text_dir.mkdir(parents=True, exist_ok=True)
-    text_path = text_dir / f"{pdf_path.stem}.txt"
+    text_path = text_dir / f"{Path(filename).stem}.txt"
     
     with open(text_path, 'w', encoding='utf-8') as f:
         f.write(extraction_result['text'])
     
-    # Summarize using chosen API
-    summary_result = summarize_paper(
-        extraction_result['text'], 
-        filename, 
-        api_key,
-        provider
-    )
+    # Summarize using chosen method
+    if use_langchain:
+        from langchain_pipeline import process_paper_with_langchain
+        summary_result = process_paper_with_langchain(
+            extraction_result['text'], 
+            filename, 
+            api_key,
+            provider
+        )
+    else:
+        summary_result = summarize_paper(
+            extraction_result['text'], 
+            filename, 
+            api_key,
+            provider
+        )
     
     # Add extraction info
     summary_result['num_pages'] = extraction_result['num_pages']
@@ -197,7 +213,9 @@ def save_results_to_csv(results, output_path):
     
     print(f"\nResults saved to: {output_path}")
 
-def main(papers_dir='project/papers', output_dir='project/outputs', max_workers=5, provider='anthropic', use_langchain=False):
+def main(papers_dir='project/papers', output_dir='project/outputs', max_workers=5, 
+         provider='anthropic', use_langchain=False, check_pubmed=False, 
+         pubmed_query='', user_email='', cloud_provider='local'):
     """
     Main pipeline to process all papers.
     
@@ -207,8 +225,57 @@ def main(papers_dir='project/papers', output_dir='project/outputs', max_workers=
         max_workers: Number of parallel workers for API calls
         provider: 'anthropic' or 'openai'
         use_langchain: Whether to use LangChain pipeline
+        check_pubmed: Whether to check PubMed for new papers
+        pubmed_query: PubMed search query
+        user_email: Email for notifications
+        cloud_provider: 'local', 'aws', or 'azure'
     """
     start_time = time.time()
+    
+    print(f"{'='*60}")
+    print(f"Research Paper Processing Pipeline")
+    print(f"{'='*60}")
+    print(f"Platform: {sys.platform}")
+    print(f"Cloud Provider: {cloud_provider.upper()}")
+    print(f"API Provider: {provider.upper()}")
+    print(f"Processing Method: {'LangChain' if use_langchain else 'Direct API'}")
+    
+    # Initialize cloud storage
+    storage = get_storage_client(cloud_provider)
+    
+    # Check PubMed for new papers if requested
+    if check_pubmed and pubmed_query:
+        print(f"\n{'='*60}")
+        print("Checking PubMed for new papers...")
+        print(f"{'='*60}")
+        
+        tracking_file = os.path.join(output_dir, 'processed_papers.json')
+        new_papers = find_new_papers(pubmed_query, tracking_file, max_results=100, days_back=30)
+        
+        if new_papers:
+            print(f"\n✓ Found {len(new_papers)} new papers!")
+            
+            # Send email notification
+            if user_email:
+                email_method = 'aws_ses' if cloud_provider == 'aws' else \
+                              'azure' if cloud_provider == 'azure' else 'smtp'
+                
+                print(f"Sending email notification to {user_email}...")
+                notify_new_papers(new_papers, user_email, pubmed_query, method=email_method)
+            
+            # Save paper details
+            new_papers_file = os.path.join(output_dir, f'new_papers_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+            with open(new_papers_file, 'w') as f:
+                json.dump(new_papers, f, indent=2)
+            print(f"New papers list saved to: {new_papers_file}")
+            
+            # Update processed papers list
+            processed = load_processed_papers(tracking_file)
+            processed.update(p['pmid'] for p in new_papers)
+            save_processed_papers(tracking_file, processed)
+        else:
+            print("No new papers found.")
+    
     # Validate provider
     provider = provider.lower()
     if provider not in ['anthropic', 'openai']:
@@ -245,12 +312,7 @@ def main(papers_dir='project/papers', output_dir='project/outputs', max_workers=
         print(f"No PDF files found in {papers_dir}")
         return
     
-    print(f"{'='*60}")
-    print(f"Research Paper Processing Pipeline")
-    print(f"{'='*60}")
-    print(f"API Provider: {provider.upper()}")
-    print(f"Processing Method: {'LangChain' if use_langchain else 'Direct API'}")
-    print(f"Found {len(pdf_files)} PDF files")
+    print(f"\nFound {len(pdf_files)} PDF files")
     
     # Estimate costs
     cost_estimate = estimate_cost(len(pdf_files), provider=provider)
@@ -276,7 +338,7 @@ def main(papers_dir='project/papers', output_dir='project/outputs', max_workers=
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks
         future_to_pdf = {
-            executor.submit(process_single_paper, pdf_path, output_dir, api_key, provider): pdf_path
+            executor.submit(process_single_paper, pdf_path, output_dir, api_key, provider, use_langchain): pdf_path
             for pdf_path in pdf_files
         }
         
@@ -303,15 +365,45 @@ def main(papers_dir='project/papers', output_dir='project/outputs', max_workers=
                 
                 pbar.update(1)
     
-    # Save results to CSV
+    # Save results locally first
     csv_path = Path(output_dir) / f'paper_summaries_{provider}.csv'
     save_results_to_csv(results, csv_path)
     
-    # Save detailed JSON results
     json_path = Path(output_dir) / f'paper_summaries_{provider}.json'
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=2)
     print(f"Detailed results saved to: {json_path}")
+    
+    # Aggregate biomarkers
+    print(f"\n{'='*60}")
+    print("Aggregating biomarker data across papers...")
+    print(f"{'='*60}")
+    
+    aggregator = BiomarkerAggregator()
+    for result in results:
+        if result.get('status') == 'success':
+            aggregator.add_paper_results(result)
+    
+    summary = aggregator.get_summary()
+    print(f"\nBiomarker Summary:")
+    print(f"  Total unique biomarkers: {summary['total_unique_biomarkers']}")
+    print(f"  Total associations: {summary['total_biomarker_disease_associations']}")
+    
+    # Save biomarker data
+    biomarker_json_path = Path(output_dir) / f'biomarkers_aggregated_{provider}.json'
+    aggregator.export_to_json(str(biomarker_json_path))
+    
+    biomarker_csv_path = Path(output_dir) / f'biomarkers_aggregated_{provider}.csv'
+    aggregator.export_to_csv(str(biomarker_csv_path))
+    
+    # Find high-confidence associations
+    high_conf = aggregator.find_high_confidence_associations(min_papers=2)
+    if high_conf:
+        print(f"\nHigh-confidence associations (mentioned in 2+ papers): {len(high_conf)}")
+        high_conf_path = Path(output_dir) / f'high_confidence_associations_{provider}.json'
+        with open(high_conf_path, 'w') as f:
+            json.dump(high_conf, f, indent=2)
+        print(f"Saved to: {high_conf_path}")
     
     # Calculate and save metrics
     end_time = time.time()
@@ -322,6 +414,27 @@ def main(papers_dir='project/papers', output_dir='project/outputs', max_workers=
         json.dump(metrics, f, indent=2)
     print(f"Metrics saved to: {metrics_path}")
     
+    # Upload to cloud if not local
+    if cloud_provider != 'local':
+        print(f"\n{'='*60}")
+        print(f"Uploading results to {cloud_provider.upper()}...")
+        print(f"{'='*60}")
+        
+        files_to_upload = [
+            csv_path,
+            json_path,
+            biomarker_json_path,
+            biomarker_csv_path,
+            metrics_path
+        ]
+        
+        if high_conf:
+            files_to_upload.append(high_conf_path)
+        
+        for local_file in files_to_upload:
+            remote_path = f"outputs/{local_file.name}"
+            storage.upload_file(str(local_file), remote_path)
+    
     # Print summary statistics
     successful = sum(1 for r in results if r.get('status') == 'success')
     failed = len(results) - successful
@@ -329,6 +442,8 @@ def main(papers_dir='project/papers', output_dir='project/outputs', max_workers=
     print(f"\n{'='*60}")
     print(f"Processing Complete!")
     print(f"{'='*60}")
+    print(f"Platform: {sys.platform}")
+    print(f"Cloud Provider: {cloud_provider.upper()}")
     print(f"API Provider: {provider.upper()}")
     print(f"Total papers: {len(results)}")
     print(f"Successful: {successful}")
@@ -337,6 +452,8 @@ def main(papers_dir='project/papers', output_dir='project/outputs', max_workers=
     print(f"Papers per minute: {metrics['papers_per_minute']:.2f}")
     print(f"Average quality score: {metrics['average_quality_score']:.3f}")
     print(f"Total biomarkers extracted: {metrics['total_biomarkers_extracted']}")
+    print(f"Unique biomarkers: {summary['total_unique_biomarkers']}")
+    print(f"Biomarker-disease associations: {summary['total_biomarker_disease_associations']}")
     
     if failed > 0:
         print(f"\nFailed papers:")
@@ -358,7 +475,17 @@ if __name__ == '__main__':
                         help='API provider to use: anthropic (Claude) or openai (GPT-4) (default: anthropic)')
     parser.add_argument('--use-langchain', action='store_true',
                         help='Use LangChain pipeline for structured extraction (default: False)')
+    parser.add_argument('--check-pubmed', action='store_true',
+                        help='Check PubMed for new papers before processing')
+    parser.add_argument('--pubmed-query', default='',
+                        help='PubMed search query (e.g., "cancer biomarkers")')
+    parser.add_argument('--email', default='',
+                        help='Email address for new paper notifications')
+    parser.add_argument('--cloud', choices=['local', 'aws', 'azure'], default='local',
+                        help='Cloud storage provider (default: local)')
     
     args = parser.parse_args()
     
-    main(args.papers_dir, args.output_dir, args.workers, args.provider, args.use_langchain)
+    main(args.papers_dir, args.output_dir, args.workers, args.provider, 
+         args.use_langchain, args.check_pubmed, args.pubmed_query, 
+         args.email, args.cloud)
